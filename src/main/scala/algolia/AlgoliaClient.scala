@@ -94,7 +94,7 @@ class AlgoliaClient(applicationId: String,
   )
 
   private val HMAC_SHA256 = "HmacSHA256"
-  private[algolia] val hostsStatuses =
+  private[algolia] lazy val hostsStatuses =
     HostsStatuses(configuration, utils, queryHosts, indexingHosts)
 
   def execute[QUERY, RESULT](query: QUERY)(implicit executable: Executable[QUERY, RESULT],
@@ -125,26 +125,40 @@ class AlgoliaClient(applicationId: String,
       hostsStatuses.indexingHostsThatAreUp()
     }
 
-    val result = hosts.foldLeft(Future.failed[T](new TimeoutException())) { (future, host) =>
+    def makeRequest(host: String): Future[T] =
+      httpClient.request[T](host, headers, payload).andThen {
+        case Failure(_) => hostsStatuses.markHostAsDown(host)
+        case Success(_) => hostsStatuses.markHostAsUp(host)
+      }
+
+    val result = hosts.foldLeft(Future.failed[T](StartException())) { (future, host) =>
       future.recoverWith {
-        case e: APIClientException => Future.failed(e) //No retry if 4XX
-        case _ =>
-          httpClient.request[T](host, headers, payload).andThen {
-            case Failure(_) => hostsStatuses.markHostAsDown(host)
-            case Success(_) => hostsStatuses.markHostAsUp(host)
+        case _: StartException => makeRequest(host)
+        case exception =>
+          exception.getCause match {
+            case e: APIClientException =>
+              Future.failed(e) //No retry if 4XX
+            case _ =>
+              makeRequest(host)
           }
       }
     }
 
     result.recoverWith {
-      case e: APIClientException =>
-        Future.failed(new AlgoliaClientException(e.getMessage, e.getCause))
-      case e: AlgoliaClientException => Future.failed(e)
-      case e: Throwable =>
-        Future.failed(new AlgoliaClientException("Failed on last retry", e))
+      case exception =>
+        exception.getCause match {
+          case e: APIClientException =>
+            Future.failed(new AlgoliaClientException(e.getMessage, e.getCause))
+          case e: AlgoliaClientException =>
+            Future.failed(e)
+          case e @ _ =>
+            Future.failed(new AlgoliaClientException("Failed on last retry", e))
+        }
     }
   }
 }
+
+private[algolia] case class StartException() extends Exception
 
 class AlgoliaClientException(message: String, exception: Throwable)
     extends Exception(message, exception) {
